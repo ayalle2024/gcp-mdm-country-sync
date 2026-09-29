@@ -1,0 +1,161 @@
+# orquestador-mdm-country-sync
+#
+# Disparado manualmente (botón "Execute" en la consola).
+# Encadena en una sola ejecución los 3 pasos que hasta ahora había que
+# correr por separado a mano:
+#
+#   1) Llama a cr-mdm-ingest-country (Cloud Run) y espera su respuesta
+#      completa. Verifica explícitamente que confirmó éxito.
+#   2) Dispara sq_detect_country_changes vía la API de BigQuery Data
+#      Transfer, y espera (con polling) a que termine de verdad.
+#   3) Llama a cf-update-mdm-country (Cloud Function HTTP), enviándole la
+#      hora de inicio de esta ejecución (since), y espera su respuesta. La
+#      función procesa solo los cambios detectados desde esa hora y los
+#      envía a cr-crud-mdm-country-api, que es la única vía de escritura
+#      al maestro (Firestore).
+#
+# cf-notify-downstream NO se llama desde aquí: se dispara solo, vía su
+# propio trigger de Pub/Sub, en cuanto cr-crud-mdm-country-api publica un
+# evento en mdm-country-updates (uno por cada cambio real).
+#
+# Los valores de configuración se leen de las Environment Variables del
+# propio Workflow (ver env.yaml en esta misma carpeta) — nada hardcodeado.
+
+main:
+  params: []
+  steps:
+    - init:
+        assign:
+          - project_id: ${sys.get_env("project_id")}
+          - project_number: ${sys.get_env("project_number")}
+          - region: ${sys.get_env("region")}
+          - transfer_location: ${sys.get_env("transfer_location")}
+          - cloud_run_service_name: ${sys.get_env("cloud_run_service_name")}
+          - transfer_config_id: ${sys.get_env("transfer_config_id")}
+          - poll_interval_seconds: ${int(sys.get_env("poll_interval_seconds"))}
+          - cf_update_mdm_country_url: ${sys.get_env("cf_update_mdm_country_url")}
+          - run_started_at: ${time.format(sys.now())}
+
+          - cloud_run_url: ${"https://" + cloud_run_service_name + "-" + project_number + "." + region + ".run.app"}
+          - transfer_config_name: ${"projects/" + project_number + "/locations/" + transfer_location + "/transferConfigs/" + transfer_config_id}
+
+    # -----------------------------------------------------------------
+    # Paso 1: ejecutar la Cloud Run de ingesta y esperar su respuesta completa
+    # -----------------------------------------------------------------
+    - call_ingest:
+        try:
+          steps:
+            - do_call_ingest:
+                call: http.post
+                args:
+                  url: ${cloud_run_url}
+                  auth:
+                    type: OIDC
+                result: ingest_response
+        except:
+          as: ingest_error
+          steps:
+            - build_ingest_error_message:
+                assign:
+                  - ingest_error_message: '${"Fallo llamando a cr-mdm-ingest-country: " + json.encode_to_string(ingest_error)}'
+            - raise_ingest_error:
+                raise: ${ingest_error_message}
+
+    - log_ingest_result:
+        call: sys.log
+        args:
+          text: ${ingest_response.body}
+          severity: INFO
+
+    - check_ingest_status:
+        switch:
+          - condition: ${ingest_response.body.status != "success"}
+            raise: '${"cr-mdm-ingest-country no confirmó éxito: " + json.encode_to_string(ingest_response.body)}'
+
+    # -----------------------------------------------------------------
+    # Paso 2: disparar la Scheduled Query manualmente
+    # -----------------------------------------------------------------
+    - trigger_scheduled_query:
+        call: googleapis.bigquerydatatransfer.v1.projects.locations.transferConfigs.startManualRuns
+        args:
+          parent: ${transfer_config_name}
+          body:
+            requestedRunTime: ${time.format(sys.now())}
+        result: transfer_start_response
+
+    - extract_run_name:
+        assign:
+          - transfer_run_name: ${transfer_start_response.runs[0].name}
+
+    # -----------------------------------------------------------------
+    # Paso 3: esperar (polling) a que la Scheduled Query termine de verdad
+    # -----------------------------------------------------------------
+    - check_transfer_run_status:
+        call: googleapis.bigquerydatatransfer.v1.projects.locations.transferConfigs.runs.get
+        args:
+          name: ${transfer_run_name}
+        result: transfer_run_status
+
+    - log_transfer_status:
+        call: sys.log
+        args:
+          text: '${"Estado de sq_detect_country_changes: " + transfer_run_status.state}'
+          severity: INFO
+
+    - evaluate_transfer_status:
+        switch:
+          - condition: ${transfer_run_status.state == "SUCCEEDED"}
+            next: call_update_mdm_country
+          - condition: ${transfer_run_status.state == "FAILED" or transfer_run_status.state == "CANCELLED"}
+            next: build_transfer_failure_message
+        next: wait_before_retry
+
+    - wait_before_retry:
+        call: sys.sleep
+        args:
+          seconds: ${poll_interval_seconds}
+        next: check_transfer_run_status
+
+    - build_transfer_failure_message:
+        assign:
+          - transfer_error_detail: ${map.get(transfer_run_status, "errorStatus")}
+          - transfer_failure_message: '${"sq_detect_country_changes terminó en estado " + transfer_run_status.state + ". Detalle: " + json.encode_to_string(transfer_error_detail)}'
+
+    - workflow_failure_transfer:
+        raise: ${transfer_failure_message}
+
+    # -----------------------------------------------------------------
+    # Paso 4: llamar a cf-update-mdm-country y esperar su respuesta completa
+    # -----------------------------------------------------------------
+    - call_update_mdm_country:
+        try:
+          steps:
+            - do_call_update_mdm_country:
+                call: http.post
+                args:
+                  url: ${cf_update_mdm_country_url}
+                  body:
+                    since: ${run_started_at}
+                  auth:
+                    type: OIDC
+                result: update_response
+        except:
+          as: update_error
+          steps:
+            - build_update_error_message:
+                assign:
+                  - update_error_message: '${"Fallo llamando a cf-update-mdm-country: " + json.encode_to_string(update_error)}'
+            - raise_update_error:
+                raise: ${update_error_message}
+
+    - log_update_result:
+        call: sys.log
+        args:
+          text: ${update_response.body}
+          severity: INFO
+
+    - workflow_success:
+        return:
+          ingest_result: ${ingest_response.body}
+          scheduled_query_final_state: ${transfer_run_status.state}
+          update_result: ${update_response.body}
