@@ -1,0 +1,19 @@
+[project]
+name = "cr-crud-mdm-country-api"
+version = "0.1.0"
+description = "Cloud Run CRUD API over the country master data store in Firestore, with audit trail in BigQuery."
+requires-python = ">=3.11"
+dependencies = [
+    "flask>=3.0",
+    "gunicorn>=21.2",
+    "google-cloud-firestore>=2.16",
+    "google-cloud-bigquery>=3.25",
+    "google-cloud-pubsub>=2.21",
+]
+
+[project.optional-dependencies]
+test = ["pytest>=8.0"]
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+testpaths = ["tests"]

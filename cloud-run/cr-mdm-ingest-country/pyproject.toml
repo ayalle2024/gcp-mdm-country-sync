@@ -1,0 +1,18 @@
+[project]
+name = "cr-mdm-ingest-country"
+version = "0.1.0"
+description = "Cloud Run service that ingests country master data from countries.dev into BigQuery raw layer."
+requires-python = ">=3.11"
+dependencies = [
+    "flask>=3.0",
+    "gunicorn>=21.2",
+    "requests>=2.31",
+    "google-cloud-bigquery>=3.25",
+]
+
+[project.optional-dependencies]
+test = ["pytest>=8.0"]
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+testpaths = ["tests"]
